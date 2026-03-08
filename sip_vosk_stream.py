@@ -14,8 +14,6 @@ import sys
 import wave
 from typing import BinaryIO, Tuple
 
-from vosk import KaldiRecognizer, Model
-
 # ==========================
 # Заглушки (подставьте свои)
 # ==========================
@@ -60,13 +58,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def open_audio_source(wav_path: str) -> Tuple[BinaryIO, wave.Wave_read | None]:
+def open_audio_source(wav_path: str) -> Tuple[BinaryIO, wave.Wave_read | None, int | None]:
     """
     Открывает источник аудио:
     - EAGI fd=3, если --wav не передан;
     - WAV файл, если --wav передан.
 
-    Возвращает (stream, wav_obj_or_none).
+    Возвращает (stream, wav_obj_or_none, wav_sample_rate_or_none).
     wav_obj нужен, чтобы корректно закрыть wave reader.
     """
     if wav_path:
@@ -76,12 +74,12 @@ def open_audio_source(wav_path: str) -> Tuple[BinaryIO, wave.Wave_read | None]:
             raise ValueError("WAV должен быть mono (1 channel)")
         if wav_reader.getsampwidth() != 2:
             raise ValueError("WAV должен быть PCM16 (sample width = 2 bytes)")
-        return wav_reader, wav_reader
+        return wav_reader, wav_reader, wav_reader.getframerate()
 
     # fd=3 — стандартный аудиопоток EAGI от Asterisk.
     # Если скрипт запущен вручную, fd=3 обычно не существует -> понятная ошибка.
     try:
-        return os.fdopen(3, "rb", buffering=0), None
+        return os.fdopen(3, "rb", buffering=0), None, None
     except OSError as exc:
         raise RuntimeError(
             "Не удалось открыть fd=3. Скрипт должен быть запущен Asterisk через EAGI, "
@@ -89,7 +87,7 @@ def open_audio_source(wav_path: str) -> Tuple[BinaryIO, wave.Wave_read | None]:
         ) from exc
 
 
-def recognize_stream(audio_stream: BinaryIO, recognizer: KaldiRecognizer, from_wav: bool) -> None:
+def recognize_stream(audio_stream: BinaryIO, recognizer, from_wav: bool) -> None:
     """Читает поток и выводит PARTIAL/FINAL в реальном времени."""
     last_partial = ""
 
@@ -121,6 +119,16 @@ def main() -> int:
     """Точка входа."""
     args = parse_args()
 
+    from_wav = bool(args.wav)
+    wav_obj = None
+    wav_rate = None
+
+    try:
+        audio_stream, wav_obj, wav_rate = open_audio_source(args.wav)
+    except (RuntimeError, ValueError, wave.Error) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 2
+
     if not os.path.isdir(args.model):
         print(
             f"[ERROR] Vosk model not found: {args.model}\n"
@@ -129,21 +137,28 @@ def main() -> int:
         )
         return 1
 
-    print("[INFO] Loading Vosk model...", flush=True)
-    model = Model(args.model)
-    recognizer = KaldiRecognizer(model, args.sample_rate)
-
-    from_wav = bool(args.wav)
-    wav_obj = None
+    # Для WAV удобнее автоматически брать частоту из файла,
+    # чтобы не передавать --sample-rate вручную.
+    effective_sample_rate = wav_rate if (from_wav and wav_rate) else args.sample_rate
 
     try:
-        audio_stream, wav_obj = open_audio_source(args.wav)
-    except (RuntimeError, ValueError, wave.Error) as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        return 2
+        from vosk import KaldiRecognizer, Model
+    except ModuleNotFoundError:
+        print(
+            "[ERROR] Пакет 'vosk' не установлен. Установите зависимости: pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 3
+
+    print("[INFO] Loading Vosk model...", flush=True)
+    model = Model(args.model)
+    recognizer = KaldiRecognizer(model, effective_sample_rate)
 
     source_label = args.wav if from_wav else "EAGI fd=3"
-    print(f"[INFO] Streaming recognition started. Source: {source_label}", flush=True)
+    print(
+        f"[INFO] Streaming recognition started. Source: {source_label}, sample_rate={effective_sample_rate}",
+        flush=True,
+    )
 
     try:
         recognize_stream(audio_stream, recognizer, from_wav=from_wav)
