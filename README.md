@@ -26,15 +26,28 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Скачайте модель Vosk и распакуйте в папку `./model`.
+Скачайте модель Vosk и распакуйте в папку `./model` (или укажите другую через `--model`).
 
 ## Запуск
+
+### 1) Боевой режим через Asterisk EAGI
+
+Скрипт запускает Asterisk. В этом режиме аудио читается из `fd=3` автоматически.
 
 ```bash
 python3 sip_vosk_stream.py
 ```
 
-Обычно скрипт запускается самим Asterisk (EAGI), а не вручную.
+> Если запустить эту команду вручную в обычном shell, `fd=3` чаще всего отсутствует,
+> и вы получите понятную ошибку с подсказкой.
+
+### 2) Локальный тест без Asterisk
+
+```bash
+python3 sip_vosk_stream.py --wav /path/to/test.wav --model ./model --sample-rate 8000
+```
+
+Требования к WAV для простого примера: mono, PCM16.
 
 ## Что нужно подставить
 
@@ -44,5 +57,7 @@ python3 sip_vosk_stream.py
 - `ASTERISK_AUDIO_SOURCE`
 - `EXTENSION`
 - `CODEC`
-- `MODEL_PATH`
-- `SAMPLE_RATE`
+
+Дополнительно задайте свои значения запуска:
+- `--model` (или измените `MODEL_PATH`)
+- `--sample-rate` (должен совпадать с реальным входным аудио)
