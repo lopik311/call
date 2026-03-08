@@ -16,7 +16,8 @@ import os
 import socket
 import sys
 import wave
-from typing import Iterable
+from dataclasses import dataclass
+from typing import Generator
 
 # ==========================
 # Заглушки (подставьте свои)
@@ -28,7 +29,7 @@ EXTENSION = "YOUR_EXTENSION"
 CODEC = "slin"
 
 # AudioSocket endpoint (должен совпадать с dialplan)
-AUDIOSOCKET_HOST = "0.0.0.0"
+AUDIOSOCKET_HOST = "127.0.0.1"
 AUDIOSOCKET_PORT = 9092
 
 # Путь к модели Vosk
@@ -40,9 +41,20 @@ SAMPLE_RATE = 8000
 # Размер куска для WAV-режима
 CHUNK_SIZE = 4000
 
-# В AudioSocket фреймы содержат type + len + payload.
-# Для учебного примера считаем аудио-типами следующие значения.
+# Типы фреймов AudioSocket
+FRAME_UUID = 0x01
+FRAME_DTMF = 0x03
+FRAME_HANGUP = 0x00
+FRAME_ERROR = 0xFF
+
+# Аудио-типы (обычно slin*). В учебном примере поддерживаем набор популярных значений.
 AUDIO_FRAME_TYPES = {0x10, 0x11, 0x12, 0x13}
+
+
+@dataclass
+class AudioSocketFrame:
+    frame_type: int
+    payload: bytes
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=AUDIOSOCKET_HOST, help="Хост для AudioSocket сервера")
     parser.add_argument("--port", type=int, default=AUDIOSOCKET_PORT, help="Порт для AudioSocket сервера")
     parser.add_argument("--wav", default="", help="Локальный WAV тест (mono, PCM16)")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Обработать только одно соединение и завершиться (по умолчанию сервер принимает звонки в цикле)",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Печатать служебные фреймы AudioSocket")
     return parser.parse_args()
 
 
@@ -68,11 +86,11 @@ def read_exact(sock: socket.socket, n: int) -> bytes:
     return b"".join(chunks)
 
 
-def iter_audiosocket_audio_payloads(conn: socket.socket) -> Iterable[bytes]:
+def iter_audiosocket_frames(conn: socket.socket) -> Generator[AudioSocketFrame, None, None]:
     """
-    Итерирует только аудио payload из AudioSocket-фреймов.
+    Итерирует фреймы AudioSocket.
 
-    Frame format (упрощенно):
+    Формат фрейма:
     - 1 байт: type
     - 2 байта: payload len (big-endian)
     - payload
@@ -88,9 +106,7 @@ def iter_audiosocket_audio_payloads(conn: socket.socket) -> Iterable[bytes]:
         if payload_len and not payload:
             return
 
-        # Типы аудио отдаем в Vosk, служебные игнорируем.
-        if frame_type in AUDIO_FRAME_TYPES and payload:
-            yield payload
+        yield AudioSocketFrame(frame_type=frame_type, payload=payload)
 
 
 def recognize_stream_from_wav(wav_path: str, recognizer) -> None:
@@ -122,24 +138,81 @@ def recognize_stream_from_wav(wav_path: str, recognizer) -> None:
             print(f"[FINAL_TAIL] {tail}", flush=True)
 
 
-def recognize_stream_from_audiosocket(conn: socket.socket, recognizer) -> None:
+def recognize_stream_from_audiosocket(conn: socket.socket, recognizer, verbose: bool = False) -> None:
     """Streaming распознавание из входящего AudioSocket TCP соединения."""
     last_partial = ""
+    seen_uuid = False
+    seen_audio = False
 
-    for data in iter_audiosocket_audio_payloads(conn):
-        if recognizer.AcceptWaveform(data):
-            text = json.loads(recognizer.Result()).get("text", "").strip()
-            if text:
-                print(f"[FINAL] {text}", flush=True)
-        else:
-            partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
-            if partial and partial != last_partial:
-                print(f"[PARTIAL] {partial}", flush=True)
-                last_partial = partial
+    for frame in iter_audiosocket_frames(conn):
+        frame_type = frame.frame_type
+        payload = frame.payload
+
+        if frame_type == FRAME_UUID:
+            seen_uuid = True
+            uuid_hex = payload.hex()
+            print(f"[INFO] AudioSocket UUID frame: {uuid_hex}", flush=True)
+            continue
+
+        if frame_type in AUDIO_FRAME_TYPES:
+            seen_audio = True
+            if recognizer.AcceptWaveform(payload):
+                text = json.loads(recognizer.Result()).get("text", "").strip()
+                if text:
+                    print(f"[FINAL] {text}", flush=True)
+            else:
+                partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
+                if partial and partial != last_partial:
+                    print(f"[PARTIAL] {partial}", flush=True)
+                    last_partial = partial
+            continue
+
+        if frame_type == FRAME_DTMF:
+            try:
+                symbol = payload.decode("utf-8", errors="replace")
+            except Exception:
+                symbol = payload.hex()
+            print(f"[INFO] DTMF: {symbol}", flush=True)
+            continue
+
+        if frame_type == FRAME_ERROR:
+            try:
+                err = payload.decode("utf-8", errors="replace")
+            except Exception:
+                err = payload.hex()
+            print(f"[ERROR] AudioSocket remote error: {err}", file=sys.stderr, flush=True)
+            continue
+
+        if frame_type == FRAME_HANGUP:
+            if verbose:
+                print("[INFO] HANGUP frame received", flush=True)
+            break
+
+        if verbose:
+            print(f"[INFO] Ignored frame type=0x{frame_type:02x}, len={len(payload)}", flush=True)
 
     tail = json.loads(recognizer.FinalResult()).get("text", "").strip()
     if tail:
         print(f"[FINAL_TAIL] {tail}", flush=True)
+
+    if not seen_uuid:
+        print("[WARN] UUID frame не получен (проверьте AudioSocket поток)", flush=True)
+    if not seen_audio:
+        print("[WARN] Аудио-фреймы не получены. Проверьте codec/формат в Asterisk.", flush=True)
+
+
+def handle_one_audiosocket_call(server: socket.socket, args: argparse.Namespace, model) -> None:
+    """Обрабатывает одно входящее соединение AudioSocket."""
+    from vosk import KaldiRecognizer
+
+    recognizer = KaldiRecognizer(model, args.sample_rate)
+
+    print(f"[INFO] Waiting AudioSocket connection on {args.host}:{args.port} ...", flush=True)
+    conn, addr = server.accept()
+    with conn:
+        print(f"[INFO] AudioSocket connected: {addr}", flush=True)
+        recognize_stream_from_audiosocket(conn, recognizer, verbose=args.verbose)
+        print("[INFO] AudioSocket disconnected", flush=True)
 
 
 def main() -> int:
@@ -150,18 +223,19 @@ def main() -> int:
         return 1
 
     try:
-        from vosk import KaldiRecognizer, Model
+        from vosk import Model
     except ModuleNotFoundError:
         print("[ERROR] Пакет 'vosk' не установлен. Выполните: pip install -r requirements.txt", file=sys.stderr)
         return 2
 
     print("[INFO] Loading Vosk model...", flush=True)
     model = Model(args.model)
-    recognizer = KaldiRecognizer(model, args.sample_rate)
 
     if args.wav:
-        print(f"[INFO] Source: WAV ({args.wav}), sample_rate={args.sample_rate}", flush=True)
         try:
+            from vosk import KaldiRecognizer
+            recognizer = KaldiRecognizer(model, args.sample_rate)
+            print(f"[INFO] Source: WAV ({args.wav}), sample_rate={args.sample_rate}", flush=True)
             recognize_stream_from_wav(args.wav, recognizer)
         except (wave.Error, ValueError, FileNotFoundError) as exc:
             print(f"[ERROR] {exc}", file=sys.stderr)
@@ -169,19 +243,19 @@ def main() -> int:
         print("[INFO] Finished.", flush=True)
         return 0
 
-    print(f"[INFO] Waiting AudioSocket connection on {args.host}:{args.port} ...", flush=True)
+    # Режим AudioSocket-сервера. По умолчанию работает постоянно (удобно для прод/теста).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, args.port))
-        server.listen(1)
+        server.listen(5)
 
-        conn, addr = server.accept()
-        with conn:
-            print(f"[INFO] AudioSocket connected: {addr}", flush=True)
-            try:
-                recognize_stream_from_audiosocket(conn, recognizer)
-            except KeyboardInterrupt:
-                print("\n[INFO] Interrupted by user.", flush=True)
+        try:
+            while True:
+                handle_one_audiosocket_call(server, args, model)
+                if args.once:
+                    break
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted by user.", flush=True)
 
     print("[INFO] Finished.", flush=True)
     return 0
